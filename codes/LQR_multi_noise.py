@@ -5,34 +5,7 @@ import time
 
 
 # =========================
-#   Multiplicative-noise helpers (LQRm)
-# =========================
-def FK_operator(A, B, Ais, Bjs, alphas, betas, K):
-    """F_K = (A-BK)⊗(A-BK) + Σ α_i A_i⊗A_i + Σ β_j (B_j K)⊗(B_j K)."""
-    AK = A - B @ K
-    FK = np.kron(AK, AK)
-    for Ai, ai in zip(Ais, alphas):
-        FK += ai * np.kron(Ai, Ai)
-    for Bj, bj in zip(Bjs, betas):
-        BjK = Bj @ K
-        FK += bj * np.kron(BjK, BjK)
-    return FK
-
-def ms_stable(A, B, Ais, Bjs, alphas, betas, K):
-    return np.max(np.abs(np.linalg.eigvals(FK_operator(A, B, Ais, Bjs, alphas, betas, K)))) < 1.0
-
-def shrink_until_ms_stable(A, B, Ais, Bjs, alphas, betas, K, max_tries=12):
-    """Geometrically shrink variances until ρ(F_K)<1 (or stop after max_tries)."""
-    fac = 1.0
-    for _ in range(max_tries):
-        if ms_stable(A, B, Ais, Bjs, fac * alphas, fac * betas, K):
-            return fac * alphas, fac * betas, fac
-        fac *= 0.5
-    return fac * alphas, fac * betas, fac
-
-
-# =========================
-#   LQR Environment (now multiplicative-noise)
+#   LQR Environment (multiplicative-noise plant)
 # =========================
 class LQRSystem:
     def __init__(self, A_true, B_true, Q, R,
@@ -101,73 +74,110 @@ class RidgeAccumulator:
         B_hat = theta[n:, :].T
         return A_hat, B_hat
 
+
 def synthesize_lqr_controller(A, B, Q, R):
     P = solve_discrete_are(A, B, Q, R)
     K = np.linalg.inv(R + B.T @ P @ B) @ (B.T @ P @ A)
     return K, P
 
+
+#  Data collection
 def collect_random_data(env, horizon, act_std):
     X, Xn, U = [], [], []
     x = env.reset()
     for _ in range(horizon):
         u = act_std * np.random.randn(env.n_inputs, 1)
-        X.append(x.flatten()); U.append(u.flatten())
+        X.append(x.flatten())
+        U.append(u.flatten())
         x = env.step(u)
         Xn.append(x.flatten())
     return np.array(X), np.array(Xn), np.array(U)
+
 
 def mb_controller_from_estimate(Ah, Bh, varrho, zeta, psi, gamma, eps_R=1e-6):
     rhoA  = np.max(np.abs(np.linalg.eigvals(Ah)))
     normA = np.linalg.norm(Ah, 2)
     normB = np.linalg.norm(Bh, 2)
     sminB = np.linalg.svd(Bh, compute_uv=False)[-1]
+
     if (rhoA > varrho) or (normA > zeta) or (normB > psi) or (sminB < gamma):
         return np.zeros((Bh.shape[1], Ah.shape[0])), False
+    
+    n, m = Ah.shape[0], Bh.shape[1]
     try:
-        P = solve_discrete_are(Ah, Bh, np.eye(Ah.shape[0]), eps_R * np.eye(Bh.shape[1]))
+        P = solve_discrete_are(Ah, Bh, np.eye(n), eps_R * np.eye(m))
         K = np.linalg.pinv(Bh.T @ P @ Bh) @ (Bh.T @ P @ Ah)
         return K, True
     except Exception:
-        return np.zeros((Bh.shape[1], Ah.shape[0])), False
+        return np.zeros((m, n)), False
 
+
+#   Policy gradient
 def collect_trajectory_pg(env, K, horizon, exploration_std):
     states, actions, rewards, exploration_noises = [], [], [], []
     x = env.reset()
+
     for _ in range(horizon):
         eta = exploration_std * np.random.randn(env.n_inputs, 1)
         u = -K @ x + eta
         cost = x.T @ env.Q @ x + u.T @ env.R @ u
         rewards.append(-cost.item())
-        states.append(x.flatten()); actions.append(u.flatten()); exploration_noises.append(eta.flatten())
+        states.append(x.flatten())
+        actions.append(u.flatten())
+        exploration_noises.append(eta.flatten())
         x = env.step(u)
-    return {'states': np.array(states), 'actions': np.array(actions),
-            'rewards': np.array(rewards), 'exploration_noises': np.array(exploration_noises)}
+    return {
+        'states': np.array(states), 
+        'actions': np.array(actions),
+        'rewards': np.array(rewards), 
+        'exploration_noises': np.array(exploration_noises)
+        }
+
 
 def compute_policy_gradient(traj, exploration_std):
-    states = traj['states']; rewards = traj['rewards']; noises = traj['exploration_noises']
-    T = len(rewards); G = 0.0; returns = np.zeros(T)
+    states = traj['states']
+    rewards = traj['rewards']
+    noises = traj['exploration_noises']
+    T = len(rewards)
+    
+    # returns-to-go as Ψ_t, normalized (variance reduction)
+    G = 0.0
+    returns = np.zeros(T)
     for t in reversed(range(T)):
-        G = rewards[t] + G; returns[t] = G
+        G = rewards[t] + G
+        returns[t] = G
     eps = np.finfo(np.float32).eps.item()
     returns = (returns - np.mean(returns)) / (np.std(returns) + eps)
+
     grad = np.zeros((noises.shape[1], states.shape[1]))
     for t in range(T):
-        eta_t = noises[t, np.newaxis].T; x_t = states[t, np.newaxis]
+        eta_t = noises[t, np.newaxis].T
+        x_t = states[t, np.newaxis]
         grad += -(eta_t @ x_t) * returns[t]
     return grad / (exploration_std ** 2)
 
-def fro_norm(M): return np.sqrt(np.sum(M * M))
-def clip_grad_fro(g, c): 
-    n = fro_norm(g);  return g * (c / n) if (n > c and n > 0) else g
-def project_fro(K, r):
-    n = fro_norm(K);  return K * (r / n) if (n > r and n > 0) else K
 
-def rho_cl(A, B, K):  return np.max(np.abs(np.linalg.eigvals(A - B @ K)))
+def fro_norm(M):
+    return np.sqrt(np.sum(M * M))
+
+def clip_grad_fro(grad, max_norm): 
+    n = fro_norm(grad)
+    return grad * (max_norm / n) if (n > max_norm and n > 0) else grad
+
+def project_fro(K, radius):
+    n = fro_norm(K);  
+    return K * (radius / n) if (n > radius and n > 0) else K
+
+def rho_cl(A, B, K):
+    return np.max(np.abs(np.linalg.eigvals(A - B @ K)))
+
 
 def cost_safe_update(A, B, Q, R, K, step, proj_radius=None, margin=1e-2, shrink=0.5, max_tries=25):
     J_prev = infinite_horizon_cost(A, B, Q, R, K)
     K_new  = K + step
-    if proj_radius is not None: K_new = project_fro(K_new, proj_radius)
+    if proj_radius is not None: 
+        K_new = project_fro(K_new, proj_radius)
+
     tries = 0
     while tries < max_tries:
         rho = rho_cl(A, B, K_new)
@@ -175,10 +185,13 @@ def cost_safe_update(A, B, Q, R, K, step, proj_radius=None, margin=1e-2, shrink=
             J_new = infinite_horizon_cost(A, B, Q, R, K_new)
             if np.isfinite(J_new) and J_new <= J_prev:
                 return K_new, True
-        step *= shrink; K_new = K + step
-        if proj_radius is not None: K_new = project_fro(K_new, proj_radius)
+        step *= shrink
+        K_new = K + step
+        if proj_radius is not None: 
+            K_new = project_fro(K_new, proj_radius)
         tries += 1
     return K, False
+
 
 def batch_pg(env, K, horizon, sigma, n_rollouts):
     G = np.zeros_like(K); ret = 0.0
@@ -188,14 +201,21 @@ def batch_pg(env, K, horizon, sigma, n_rollouts):
         ret += traj['rewards'].sum()
     return G / n_rollouts, ret / n_rollouts
 
+
+#   Cost utilities
 def infinite_horizon_cost(A, B, Q, R, K):
-    """Deterministic LQR proxy cost (kept unchanged)."""
+    """
+    J(K) = trace(P_K) with P_K solving:
+      P_K = Q + K^T R K + (A-BK)^T P_K (A-BK)
+    (Assumes Sigma_0 = I; proportional for any PSD Sigma_0.)
+    """
     Acl = A - B @ K
     if np.max(np.abs(np.linalg.eigvals(Acl))) >= 1.0:
         return np.inf
     Qbar = Q + K.T @ R @ K
     Pk = solve_discrete_lyapunov(Acl.T, Qbar)
     return np.trace(Pk)
+
 
 def dim_aware_hyperparams(n, m):
     proj_radius   = 2.0 * np.sqrt(n * m)
@@ -205,55 +225,53 @@ def dim_aware_hyperparams(n, m):
     return proj_radius, max_grad_norm, lr, sigma
 
 def _sanitize(y):
-    y = np.asarray(y, dtype=float); y[~np.isfinite(y)] = np.nan; return y
+    y = np.asarray(y, dtype=float)
+    y[~np.isfinite(y)] = np.nan
+    return y
 
 
 # =========================
-#   make_random_lqr WITH multiplicative-noise generation
+#   make_random_lqr — now just generates multiplicative structure (no F(K))
 # =========================
-def make_random_lqr(n, m, rho_target=0.95, coupling=0.05, gamma_min=0.2, seed=None,
-                    # new args for LQRm:
-                    p=4, q=3, a_scale=0.03, b_scale=0.03,
-                    enforce_ms_stability=True):
+def make_random_lqr(n, m, p=4, q=3, a_scale=0.03, b_scale=0.03, 
+                    rho_target=0.95, coupling=0.05, gamma_min=0.2, seed=None):
     """
     Returns:
       A, B, {A_i}, {B_j}, {α_i}, {β_j}
-    A, B are generated as before; also generate multiplicative-noise directions
-    and variances. If enforce_ms_stability==True, shrink variances until
-    ρ(F_K)<1 at K=0 (mean-square stable).
+    - A is stable with spectral radius ≈ rho_target.
+    - B has σ_min(B) ≥ gamma_min.
+    - {A_i}, {B_j} are small random directions.
+    - α_i=a_scale^2, β_j=b_scale^2.
     """
     rng = np.random.default_rng(seed)
 
-    # --- A, B as before ---
+    # Nominal A, B (same recipe as before)
     diag = rho_target * (0.6 + 0.4 * rng.random(n))
     A = np.diag(diag)
     if coupling > 0:
         A += (coupling / np.sqrt(n)) * rng.standard_normal((n, n))
         s = np.max(np.abs(np.linalg.eigvals(A)))
         A *= (rho_target / (s + 1e-12))
+
     B = rng.standard_normal((n, m))
     U, S, Vt = np.linalg.svd(B, full_matrices=False)
     S = np.maximum(S, gamma_min)
     B = (U * S) @ Vt
 
-    # --- multiplicative-noise structure ---
+    # Multiplicative-noise directions + variances
     Ais = [a_scale * rng.standard_normal((n, n)) for _ in range(p)]
     Bjs = [b_scale * rng.standard_normal((n, m)) for _ in range(q)]
-    alphas = (a_scale ** 2) * np.ones(p)
-    betas  = (b_scale ** 2) * np.ones(q)
-
-    if enforce_ms_stability:
-        alphas, betas, _ = shrink_until_ms_stable(A, B, Ais, Bjs, alphas, betas, K=np.zeros((m, n)))
+    alphas = a_scale ** 2 * np.ones(p)
+    betas  = b_scale ** 2 * np.ones(q)
 
     return A, B, Ais, Bjs, alphas, betas
 
 
 # =========================
-#   Main experiment (minimal diffs)
+#   Main experiment (unchanged logic; only plant is multiplicative)
 # =========================
 def name():
-    # true system
-    state_grid = [10]    # 500 is possible but slow; try later
+    state_grid = [10]
     input_grid = [8, 16, 32, 64, 128, 256]
 
     results= {}
@@ -263,47 +281,40 @@ def name():
             if m > n:
                 continue
 
-            # --- make system (now also returns LQRm parts) ---
+            # --- make system (returns LQRm parts; no F(K) checks) ---
             A_TRUE, B_TRUE, Ais, Bjs, alphas, betas = make_random_lqr(
                 n, m, rho_target=0.95, coupling=0.05, gamma_min=0.2,
-                seed=10_000 + 97*n + m, p=4, q=3, a_scale=0.03, b_scale=0.03,
-                enforce_ms_stability=True
+                seed=10_000 + 97*n + m, p=4, q=3, a_scale=0.03, b_scale=0.03
             )
 
-            N_STATES, N_INPUTS = n, m
             Q = np.eye(n)
             R = 0.1 * np.eye(m)
             NOISE_STD = 0.05
 
-            # Envs (pass multiplicative-noise structure)
+            # Environments: multiplicative-noise plant, learning unchanged
             env_mf = LQRSystem(A_TRUE, B_TRUE, Q, R, Ais=Ais, Bjs=Bjs, alphas=alphas, betas=betas, noise_std=NOISE_STD)
             env_mb = LQRSystem(A_TRUE, B_TRUE, Q, R, Ais=Ais, Bjs=Bjs, alphas=alphas, betas=betas, noise_std=NOISE_STD)
 
-            # Ground-truth optimal (deterministic proxy, kept)
+            # Ground-truth "optimal" for nominal model (same as before)
             K_opt, P_opt = synthesize_lqr_controller(A_TRUE, B_TRUE, Q, R)
             J_opt = np.trace(P_opt)
 
-            # Dim-aware PG params
             PROJ_RADIUS, MAX_GRAD_NORM, _, _ = dim_aware_hyperparams(n, m)
             SIGMA0 = 0.5 / np.sqrt(m)
             LR0 = 5e-3 / np.sqrt(n*m)
 
-            # Identify & learn
             NUM_UPDATES    = 500
             HORIZON_LENGTH = 20
             MB_ACT_STD     = 1.0
             RIDGE_LAMBDA   = 1e-3
 
-            # Gates for Alg. 3
             RHO_THR, ZETA_THR, PSI_THR, GAMMA_THR, EPS_R = 0.99, 50.0, 50.0, 1e-3, 1e-6
 
-            # States
             K_pg = np.zeros((m, n))
             acc = RidgeAccumulator(n, m)
             cum_steps_mf = cum_steps_mb = 0
             gaps_mf, gaps_mb = [], []
             steps_mf, steps_mb = [], []
-            # Timing trackers (cumulative per-method)
             cum_time_mf = 0.0
             cum_time_mb = 0.0
             times_mf, times_mb = [], []
@@ -387,7 +398,6 @@ def name():
             plt.close()
             print(f"[n={n}, m={m}] saved {fname_rt}")
 
-    # (Optionally return results)
     return results
 
 
