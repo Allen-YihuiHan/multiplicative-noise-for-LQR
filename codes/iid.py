@@ -54,8 +54,8 @@ class RidgeAccumulator:
 
 def synthesize_lqr_controller(A, B, Q, R):
     P = solve_discrete_are(A, B, Q, R)
-    K = np.linalg.inv(R + B.T @ P @ B) @ (B.T @ P @ A)
-    return K, P
+    # K = np.linalg.inv(R + B.T @ P @ B) @ (B.T @ P @ A)
+    return P
 
 
 #   Data collection
@@ -271,7 +271,6 @@ def name():
             # --- make system ---
             A_TRUE, B_TRUE = make_random_lqr(n, m, rho_target=0.95, coupling=0.05, gamma_min=0.2, seed=10_000 + 97*n + m)
 
-            N_STATES, N_INPUTS = n, m
             Q = np.eye(n)
             R = 0.1 * np.eye(m)
             NOISE_STD = 0.05
@@ -281,7 +280,7 @@ def name():
             env_mb = LQRSystem(A_TRUE, B_TRUE, Q, R, noise_std=NOISE_STD)
 
             # Ground-truth optimal
-            K_opt, P_opt = synthesize_lqr_controller(A_TRUE, B_TRUE, Q, R)
+            P_opt = synthesize_lqr_controller(A_TRUE, B_TRUE, Q, R)
             J_opt = np.trace(P_opt)
 
             # Dim-aware PG params
