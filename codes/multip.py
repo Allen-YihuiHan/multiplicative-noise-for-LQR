@@ -1,12 +1,12 @@
 import numpy as np
-from scipy.linalg import solve_discrete_are, solve_discrete_lyapunov
 import matplotlib.pyplot as plt
 import time
+from utils import RidgeAccumulator, synthesize_lqr_controller, collect_random_data, \
+    mb_controller_from_estimate, infinite_horizon_cost, cost_safe_update, batch_pg, \
+        dim_aware_hyperparams, clip_grad_fro, _sanitize
 
 
-# =========================
 #   LQR Environment (multiplicative-noise plant)
-# =========================
 class LQRSystem:
     def __init__(self, A_true, B_true, Q, R,
                  Ais=None, Bjs=None, alphas=None, betas=None, noise_std=0.0,
@@ -91,185 +91,7 @@ class LQRSystem:
         return self.x
 
 
-# =========================
-#   Estimation / control (unchanged)
-# =========================
-class RidgeAccumulator:
-    def __init__(self, n, m):
-        self.p = n + m
-        self.n = n
-        self.G = np.zeros((self.p, self.p))
-        self.H = np.zeros((self.p, n))
-    def update(self, X, X_next, U):
-        Z = np.hstack([X, U])
-        self.G += Z.T @ Z
-        self.H += Z.T @ X_next
-    def solve(self, lam):
-        theta = np.linalg.solve(self.G + lam * np.eye(self.p), self.H)
-        n = self.n
-        A_hat = theta[:n, :].T
-        B_hat = theta[n:, :].T
-        return A_hat, B_hat
-
-
-def synthesize_lqr_controller(A, B, Q, R):
-    P = solve_discrete_are(A, B, Q, R)
-    # K = np.linalg.inv(R + B.T @ P @ B) @ (B.T @ P @ A)
-    return P
-
-
-#  Data collection
-def collect_random_data(env, horizon, act_std):
-    X, Xn, U = [], [], []
-    x = env.reset()
-    for _ in range(horizon):
-        u = act_std * np.random.randn(env.n_inputs, 1)
-        X.append(x.flatten())
-        U.append(u.flatten())
-        x = env.step(u)
-        Xn.append(x.flatten())
-    return np.array(X), np.array(Xn), np.array(U)
-
-
-def mb_controller_from_estimate(Ah, Bh, varrho, zeta, psi, gamma, eps_R=1e-6):
-    rhoA  = np.max(np.abs(np.linalg.eigvals(Ah)))
-    normA = np.linalg.norm(Ah, 2)
-    normB = np.linalg.norm(Bh, 2)
-    sminB = np.linalg.svd(Bh, compute_uv=False)[-1]
-
-    if (rhoA > varrho) or (normA > zeta) or (normB > psi) or (sminB < gamma):
-        return np.zeros((Bh.shape[1], Ah.shape[0])), False
-    
-    n, m = Ah.shape[0], Bh.shape[1]
-    try:
-        P = solve_discrete_are(Ah, Bh, np.eye(n), eps_R * np.eye(m))
-        K = np.linalg.pinv(Bh.T @ P @ Bh) @ (Bh.T @ P @ Ah)
-        return K, True
-    except Exception:
-        return np.zeros((m, n)), False
-
-
-#   Policy gradient
-def collect_trajectory_pg(env, K, horizon, exploration_std):
-    states, actions, rewards, exploration_noises = [], [], [], []
-    x = env.reset()
-
-    for _ in range(horizon):
-        eta = exploration_std * np.random.randn(env.n_inputs, 1)
-        u = -K @ x + eta
-        cost = x.T @ env.Q @ x + u.T @ env.R @ u
-        rewards.append(-cost.item())
-        states.append(x.flatten())
-        actions.append(u.flatten())
-        exploration_noises.append(eta.flatten())
-        x = env.step(u)
-    return {
-        'states': np.array(states), 
-        'actions': np.array(actions),
-        'rewards': np.array(rewards), 
-        'exploration_noises': np.array(exploration_noises)
-        }
-
-
-def compute_policy_gradient(traj, exploration_std):
-    states = traj['states']
-    rewards = traj['rewards']
-    noises = traj['exploration_noises']
-    T = len(rewards)
-    
-    # returns-to-go as Ψ_t, normalized (variance reduction)
-    G = 0.0
-    returns = np.zeros(T)
-    for t in reversed(range(T)):
-        G = rewards[t] + G
-        returns[t] = G
-    eps = np.finfo(np.float32).eps.item()
-    returns = (returns - np.mean(returns)) / (np.std(returns) + eps)
-
-    grad = np.zeros((noises.shape[1], states.shape[1]))
-    for t in range(T):
-        eta_t = noises[t, np.newaxis].T
-        x_t = states[t, np.newaxis]
-        grad += -(eta_t @ x_t) * returns[t]
-    return grad / (exploration_std ** 2)
-
-
-def fro_norm(M):
-    return np.sqrt(np.sum(M * M))
-
-def clip_grad_fro(grad, max_norm): 
-    n = fro_norm(grad)
-    return grad * (max_norm / n) if (n > max_norm and n > 0) else grad
-
-def project_fro(K, radius):
-    n = fro_norm(K);  
-    return K * (radius / n) if (n > radius and n > 0) else K
-
-def rho_cl(A, B, K):
-    return np.max(np.abs(np.linalg.eigvals(A - B @ K)))
-
-
-def cost_safe_update(A, B, Q, R, K, step, proj_radius=None, margin=1e-2, shrink=0.5, max_tries=25):
-    J_prev = infinite_horizon_cost(A, B, Q, R, K)
-    K_new  = K + step
-    if proj_radius is not None: 
-        K_new = project_fro(K_new, proj_radius)
-
-    tries = 0
-    while tries < max_tries:
-        rho = rho_cl(A, B, K_new)
-        if rho < 1.0 - margin:
-            J_new = infinite_horizon_cost(A, B, Q, R, K_new)
-            if np.isfinite(J_new) and J_new <= J_prev:
-                return K_new, True
-        step *= shrink
-        K_new = K + step
-        if proj_radius is not None: 
-            K_new = project_fro(K_new, proj_radius)
-        tries += 1
-    return K, False
-
-
-def batch_pg(env, K, horizon, sigma, n_rollouts):
-    G = np.zeros_like(K); ret = 0.0
-    for _ in range(n_rollouts):
-        traj = collect_trajectory_pg(env, K, horizon, sigma)
-        G += compute_policy_gradient(traj, sigma)
-        ret += traj['rewards'].sum()
-    return G / n_rollouts, ret / n_rollouts
-
-
-#   Cost utilities
-def infinite_horizon_cost(A, B, Q, R, K):
-    """
-    J(K) = trace(P_K) with P_K solving:
-      P_K = Q + K^T R K + (A-BK)^T P_K (A-BK)
-    (Assumes Sigma_0 = I; proportional for any PSD Sigma_0.)
-    """
-    Acl = A - B @ K
-    if np.max(np.abs(np.linalg.eigvals(Acl))) >= 1.0:
-        return np.inf
-    Qbar = Q + K.T @ R @ K
-    Pk = solve_discrete_lyapunov(Acl.T, Qbar)
-    return np.trace(Pk)
-
-
-def dim_aware_hyperparams(n, m):
-    proj_radius   = 2.0 * np.sqrt(n * m)
-    max_grad_norm = 10.0 * np.sqrt(n * m)
-    lr            = 1e-3 / np.sqrt(n * m)
-    sigma         = 0.5  / np.sqrt(max(m,1))
-    return proj_radius, max_grad_norm, lr, sigma
-
-def _sanitize(y):
-    y = np.asarray(y, dtype=float)
-    y[~np.isfinite(y)] = np.nan
-    return y
-
-
-# =========================
-#   make_random_lqr — now just generates multiplicative structure
-# =========================
+#   generates multiplicative structure
 def make_random_lqr(
     n, m, p=4, q=3, a_scale=0.03, b_scale=0.03,
     rho_target=0.95, coupling=0.05, gamma_min=0.2,
@@ -366,10 +188,7 @@ def gamma_sampler(t):
     return 2 * np.random.standard_t(df=5, size=6)
 
 
-# =========================
-#   Main experiment (unchanged logic; only plant is multiplicative)
-# =========================
-def name():
+def run():
     state_grid = [5, 10, 20, 50]
     input_grid = [2, 4, 8, 16, 32, 64, 128, 256]
 
@@ -513,4 +332,4 @@ def name():
 
 
 if __name__ == '__main__':
-    name()
+    run()
