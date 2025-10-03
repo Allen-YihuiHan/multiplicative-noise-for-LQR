@@ -210,7 +210,7 @@ def run():
             # ----- build a nominal multiplicative plant, exactly as you already do -----
             # You likely already have a factory that returns (A, B, Ais, Bjs, alphas, betas).
             # Reuse it; here we just create a simple one for reference:
-            rng = np.random.default_rng(42)
+            rng = np.random.default_rng()
 
             A_TRUE, B_TRUE, Ais, Bjs, alphas, betas= make_random_lqr(n, m, p=16, q=12)
 
@@ -232,7 +232,7 @@ def run():
 
             Q = np.eye(n)
             R = 0.1 * np.eye(m)
-            NOISE_STD = 0.05
+            NOISE_STD = 1
 
             # two envs with the same plant (model-free / model-based comparison)
             # env_mf = LQRSystem(A_TRUE, B_TRUE, Q, R, Ais=Ais, Bjs=Bjs, alphas=alphas, betas=betas, noise_std=NOISE_STD)
@@ -254,7 +254,7 @@ def run():
             SIGMA0 = 0.5 / np.sqrt(m)
             LR0 = 5e-3 / np.sqrt(n*m)
 
-            NUM_UPDATES    = 200
+            NUM_UPDATES    = 500
             HORIZON_LENGTH = 20
             N_ROLLOUTS_MF  = 16        # for REINFORCE batch
             NR_MALS        = 12        # number of rollouts for MALS
@@ -271,7 +271,7 @@ def run():
 
             # cum_time_mf = cum_time_mb = 0.0
             # times_mf, times_mb = [], []
-            rng = np.random.default_rng(123)
+            # rng = np.random.default_rng()
 
             for i in range(NUM_UPDATES):
                 # ---------------- model-free step (unchanged) ----------------
