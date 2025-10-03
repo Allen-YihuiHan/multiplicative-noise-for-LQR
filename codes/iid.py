@@ -1,67 +1,16 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import time
-from utils import RidgeAccumulator, synthesize_lqr_controller, collect_random_data, \
-    mb_controller_from_estimate, infinite_horizon_cost, cost_safe_update, batch_pg, \
-        dim_aware_hyperparams, clip_grad_fro, _sanitize
-
-
-#   LQR Environment
-class LQRSystem:
-    def __init__(self, A_true, B_true, Q, R, noise_std=0.1):
-        self.A_true = A_true
-        self.B_true = B_true
-        self.Q = Q
-        self.R = R
-        self.noise_std = noise_std
-        self.n_states = A_true.shape[0]
-        self.n_inputs = B_true.shape[1]
-        self.reset()
-
-    def reset(self):
-        self.x = np.zeros((self.n_states, 1))
-        return self.x
-
-    def step(self, u):
-        """
-        x_{t+1} = A*x_t + B*u_t + w_t
-        """
-        if u.ndim == 1:
-            u = u.reshape(-1, 1)
-        w = self.noise_std * np.random.randn(self.n_states, 1)
-        self.x = self.A_true @ self.x + self.B_true @ u + w
-        return self.x
-
-
-def make_random_lqr(n, m, rho_target=0.95, coupling=0.05, gamma_min=0.2, seed=None):
-    """
-    Returns (A,B) with spectral radius(A) ≈ rho_target and σ_min(B) ≥ gamma_min.
-    - n: #states, m: #inputs
-    - coupling controls off-diagonal strength (0 -> diagonal A)
-    """
-    rng = np.random.default_rng(seed)
-
-    # Start from a stable diagonal A, then add small coupling and rescale to rho_target
-    diag = rho_target * (0.6 + 0.4 * rng.random(n))      # eigenvalues in (0.57, 0.95)
-    A = np.diag(diag)
-    if coupling > 0:
-        A += (coupling / np.sqrt(n)) * rng.standard_normal((n, n))
-        s = np.max(np.abs(np.linalg.eigvals(A)))
-        A *= (rho_target / (s + 1e-12))                  # enforce ρ(A) = rho_target
-
-    # Random B then lift small singular values to guarantee σ_min(B) ≥ gamma_min
-    B = rng.standard_normal((n, m))
-    U, S, Vt = np.linalg.svd(B, full_matrices=False)
-    S = np.maximum(S, gamma_min)
-    B = (U * S) @ Vt
-    return A, B
+from utils import LQRSystem, RidgeAccumulator, synthesize_lqr_controller, collect_random_data, \
+    make_random_lqr, mb_controller_from_estimate, infinite_horizon_cost, cost_safe_update, \
+    batch_pg, dim_aware_hyperparams, clip_grad_fro, _sanitize
 
 
 # @profile
 def run():
     # true system
-    state_grid = [6, 8]    # 500 is possible but slow; try later
-    input_grid = [2, 4, 8, 16, 32, 64, 128, 256]
+    state_grid = [5, 10]    # 500 is possible but slow; try later
+    input_grid = [4, 8, 16, 32, 64, 128, 256]
 
     results= {}
 
@@ -75,7 +24,7 @@ def run():
 
             Q = np.eye(n)
             R = 0.1 * np.eye(m)
-            NOISE_STD = 0.05
+            NOISE_STD = 2.5
 
             # Envs
             env_mf = LQRSystem(A_TRUE, B_TRUE, Q, R, noise_std=NOISE_STD)
